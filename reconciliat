@@ -1,0 +1,660 @@
+Below is the complete code and package structure. Replace your files with the following:
+
+com.example.reconciliation
+├── ReconciliationApplication.java
+├── config
+│   ├── ReconciliationConfig.java
+│   └── RedisConfig.java
+├── controller
+│   └── ReconciliationController.java
+├── data
+│   └── TestDataGenerator.java
+├── model
+│   ├── CompositeKey.java
+│   ├── ReconciliationResult.java
+│   └── Transaction.java
+├── repository
+│   └── RedisTransactionRepository.java
+├── service
+│   ├── KeyExtractor.java
+│   ├── ReconciliationBatchService.java
+│   └── ReconciliationService.java
+└── service/strategy
+    ├── ComparatorFactory.java
+    ├── FieldComparator.java
+    ├── EqualsComparator.java
+    └── SubstringComparator.java
+
+
+---
+
+pom.xml
+
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <!-- Spring Boot Parent -->
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.1.5</version>
+  </parent>
+
+  <groupId>com.example</groupId>
+  <artifactId>reconciliation</artifactId>
+  <version>0.0.1-SNAPSHOT</version>
+  <name>reconciliation</name>
+
+  <dependencies>
+    <!-- Spring Boot Starter Web -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- Lombok -->
+    <dependency>
+      <groupId>org.projectlombok</groupId>
+      <artifactId>lombok</artifactId>
+      <version>1.18.28</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Spring Data Redis -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+
+    <!-- Jackson for JSON processing -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+
+
+---
+
+src/main/resources/application.properties
+
+# Redis settings
+spring.redis.host=localhost
+spring.redis.port=6379
+
+# Reconciliation configuration
+reconciliation.keys=transactionId,accountNumber
+reconciliation.fields.amount.strategy=equals
+reconciliation.fields.description.strategy=substring
+reconciliation.fields.description.params.start=0
+reconciliation.fields.description.params.end=10
+
+
+---
+
+src/main/java/com/example/reconciliation/ReconciliationApplication.java
+
+package com.example.reconciliation;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class ReconciliationApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ReconciliationApplication.class, args);
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/config/ReconciliationConfig.java
+
+package com.example.reconciliation.config;
+
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+import java.util.List;
+import java.util.Map;
+
+@Data
+@Configuration
+@ConfigurationProperties(prefix = "reconciliation")
+public class ReconciliationConfig {
+    private List<String> keys;
+    private Map<String, FieldConfig> fields;
+
+    @Data
+    public static class FieldConfig {
+        private String strategy;
+        private Map<String, String> params;
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/config/RedisConfig.java
+
+package com.example.reconciliation.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+
+@Configuration
+public class RedisConfig {
+
+    @Bean
+    public RedisTemplate<String, String> redisTemplate(RedisConnectionFactory redisConnectionFactory){
+        RedisTemplate<String, String> template = new RedisTemplate<>();
+        template.setConnectionFactory(redisConnectionFactory);
+        return template;
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/model/Transaction.java
+
+package com.example.reconciliation.model;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import java.util.Map;
+
+@Data
+@AllArgsConstructor
+public class Transaction {
+    private Map<String, String> fields;
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/model/CompositeKey.java
+
+package com.example.reconciliation.model;
+
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import java.util.List;
+
+@RequiredArgsConstructor
+@EqualsAndHashCode
+@Getter
+public class CompositeKey {
+    private final List<String> values;
+    
+    @Override
+    public String toString() {
+        return String.join(":", values);
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/model/ReconciliationResult.java
+
+package com.example.reconciliation.model;
+
+import lombok.Data;
+import java.util.*;
+
+@Data
+public class ReconciliationResult {
+    private Map<CompositeKey, Map<String, ValuePair>> discrepancies = new HashMap<>();
+    private Set<CompositeKey> missingInSource1 = new HashSet<>();
+    private Set<CompositeKey> missingInSource2 = new HashSet<>();
+
+    public void addDiscrepancy(CompositeKey key, String field, String val1, String val2) {
+        discrepancies.computeIfAbsent(key, k -> new HashMap<>())
+            .put(field, new ValuePair(val1, val2));
+    }
+
+    public record ValuePair(String source1, String source2) {}
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/repository/RedisTransactionRepository.java
+
+package com.example.reconciliation.repository;
+
+import com.example.reconciliation.model.Transaction;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.redis.core.Cursor;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.ScanOptions;
+import org.springframework.stereotype.Repository;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+
+@Repository
+@RequiredArgsConstructor
+public class RedisTransactionRepository {
+
+    private final RedisTemplate<String, String> redisTemplate;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public static final String SOURCE1_KEY = "source1:transactions";
+    public static final String SOURCE2_KEY = "source2:transactions";
+
+    public void saveTransaction(String sourceKey, String compositeKey, Transaction transaction) {
+        try {
+            String json = objectMapper.writeValueAsString(transaction);
+            redisTemplate.opsForHash().put(sourceKey, compositeKey, json);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Error serializing transaction", e);
+        }
+    }
+
+    public Transaction getTransaction(String sourceKey, String compositeKey) {
+        Object obj = redisTemplate.opsForHash().get(sourceKey, compositeKey);
+        if (obj == null) return null;
+        try {
+            return objectMapper.readValue((String) obj, Transaction.class);
+        } catch (IOException e) {
+            throw new RuntimeException("Error deserializing transaction", e);
+        }
+    }
+
+    public Cursor<Map.Entry<Object, Object>> scanTransactions(String sourceKey, long count) {
+        return redisTemplate.opsForHash().scan(sourceKey, ScanOptions.scanOptions().count(count).build());
+    }
+
+    public List<Object> multiGet(String sourceKey, Collection<Object> keys) {
+        return redisTemplate.opsForHash().multiGet(sourceKey, keys);
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/service/KeyExtractor.java
+
+package com.example.reconciliation.service;
+
+import com.example.reconciliation.config.ReconciliationConfig;
+import com.example.reconciliation.model.CompositeKey;
+import com.example.reconciliation.model.Transaction;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import java.util.List;
+
+@Component
+@RequiredArgsConstructor
+public class KeyExtractor {
+    private final ReconciliationConfig config;
+
+    public CompositeKey extractKey(Transaction transaction) {
+        List<String> keyValues = config.getKeys().stream()
+            .map(key -> transaction.getFields().get(key))
+            .toList();
+        return new CompositeKey(keyValues);
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/service/ReconciliationBatchService.java
+
+package com.example.reconciliation.service;
+
+import com.example.reconciliation.config.ReconciliationConfig;
+import com.example.reconciliation.model.CompositeKey;
+import com.example.reconciliation.model.ReconciliationResult;
+import com.example.reconciliation.model.Transaction;
+import com.example.reconciliation.repository.RedisTransactionRepository;
+import com.example.reconciliation.service.strategy.FieldComparator;
+import com.example.reconciliation.service.strategy.ComparatorFactory;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.redis.core.Cursor;
+import org.springframework.stereotype.Service;
+import java.io.IOException;
+import java.util.*;
+
+@Service
+@RequiredArgsConstructor
+public class ReconciliationBatchService {
+
+    private final RedisTransactionRepository repository;
+    private final ReconciliationConfig config;
+    private final ComparatorFactory comparatorFactory;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public ReconciliationResult reconcileFromRedis() {
+        ReconciliationResult result = new ReconciliationResult();
+        Set<String> processedKeys = new HashSet<>();
+
+        Cursor<Map.Entry<Object, Object>> cursor = repository.scanTransactions(RedisTransactionRepository.SOURCE1_KEY, 1000);
+        List<String> batchKeys = new ArrayList<>();
+        Map<String, Transaction> batchSource1 = new HashMap<>();
+        while (cursor.hasNext()) {
+            Map.Entry<Object, Object> entry = cursor.next();
+            String key = (String) entry.getKey();
+            Transaction transaction = deserialize((String) entry.getValue());
+            batchSource1.put(key, transaction);
+            batchKeys.add(key);
+            if (batchKeys.size() == 1000) {
+                processBatch(batchKeys, batchSource1, result);
+                processedKeys.addAll(batchKeys);
+                batchKeys.clear();
+                batchSource1.clear();
+            }
+        }
+        if (!batchKeys.isEmpty()) {
+            processBatch(batchKeys, batchSource1, result);
+            processedKeys.addAll(batchKeys);
+        }
+
+        Cursor<Map.Entry<Object, Object>> cursor2 = repository.scanTransactions(RedisTransactionRepository.SOURCE2_KEY, 1000);
+        while (cursor2.hasNext()) {
+            Map.Entry<Object, Object> entry = cursor2.next();
+            String key = (String) entry.getKey();
+            if (!processedKeys.contains(key)) {
+                CompositeKey compositeKey = convertStringToCompositeKey(key);
+                result.getMissingInSource1().add(compositeKey);
+            }
+        }
+        return result;
+    }
+
+    private void processBatch(List<String> keys, Map<String, Transaction> batchSource1, ReconciliationResult result) {
+        List<Object> values = repository.multiGet(RedisTransactionRepository.SOURCE2_KEY, new ArrayList<>(keys));
+        for (int i = 0; i < keys.size(); i++) {
+            String key = keys.get(i);
+            Transaction t1 = batchSource1.get(key);
+            Object val2Obj = values.get(i);
+            CompositeKey compositeKey = convertStringToCompositeKey(key);
+            if (val2Obj == null) {
+                result.getMissingInSource2().add(compositeKey);
+            } else {
+                Transaction t2 = deserialize((String) val2Obj);
+                config.getFields().forEach((field, fieldConfig) -> {
+                    String val1 = t1.getFields().get(field);
+                    String val2 = t2.getFields().get(field);
+                    FieldComparator comparator = comparatorFactory.getComparator(fieldConfig.getStrategy());
+                    if (!comparator.compare(val1, val2, fieldConfig.getParams())) {
+                        result.addDiscrepancy(compositeKey, field, val1, val2);
+                    }
+                });
+            }
+        }
+    }
+
+    private Transaction deserialize(String json) {
+        try {
+            return objectMapper.readValue(json, Transaction.class);
+        } catch (IOException e) {
+            throw new RuntimeException("Error deserializing transaction", e);
+        }
+    }
+
+    private CompositeKey convertStringToCompositeKey(String key) {
+        List<String> values = Arrays.asList(key.split(":"));
+        return new CompositeKey(values);
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/service/ReconciliationService.java
+
+package com.example.reconciliation.service;
+
+import com.example.reconciliation.config.ReconciliationConfig;
+import com.example.reconciliation.model.CompositeKey;
+import com.example.reconciliation.model.ReconciliationResult;
+import com.example.reconciliation.model.Transaction;
+import com.example.reconciliation.service.strategy.ComparatorFactory;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+public class ReconciliationService {
+    private final KeyExtractor keyExtractor;
+    private final ComparatorFactory comparatorFactory;
+    private final ReconciliationConfig config;
+
+    public ReconciliationResult reconcile(List<Transaction> source1, List<Transaction> source2) {
+        Map<CompositeKey, Transaction> map1 = groupTransactions(source1);
+        Map<CompositeKey, Transaction> map2 = groupTransactions(source2);
+
+        ReconciliationResult result = new ReconciliationResult();
+        compareCommonTransactions(map1, map2, result);
+        findMissingTransactions(map1, map2, result);
+        return result;
+    }
+
+    private Map<CompositeKey, Transaction> groupTransactions(List<Transaction> transactions) {
+        return transactions.stream()
+            .collect(Collectors.toMap(
+                keyExtractor::extractKey,
+                Function.identity(),
+                (existing, replacement) -> existing
+            ));
+    }
+
+    private void compareCommonTransactions(Map<CompositeKey, Transaction> map1,
+                                           Map<CompositeKey, Transaction> map2,
+                                           ReconciliationResult result) {
+        map1.keySet().retainAll(map2.keySet());
+        map1.forEach((key, t1) -> {
+            Transaction t2 = map2.get(key);
+            config.getFields().forEach((field, fieldConfig) -> {
+                String val1 = t1.getFields().get(field);
+                String val2 = t2.getFields().get(field);
+                var comparator = comparatorFactory.getComparator(fieldConfig.getStrategy());
+                if (!comparator.compare(val1, val2, fieldConfig.getParams())) {
+                    result.addDiscrepancy(key, field, val1, val2);
+                }
+            });
+        });
+    }
+
+    private void findMissingTransactions(Map<CompositeKey, Transaction> map1,
+                                         Map<CompositeKey, Transaction> map2,
+                                         ReconciliationResult result) {
+        result.setMissingInSource2(new HashSet<>(map1.keySet()));
+        result.getMissingInSource2().removeAll(map2.keySet());
+
+        result.setMissingInSource1(new HashSet<>(map2.keySet()));
+        result.getMissingInSource1().removeAll(map1.keySet());
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/service/strategy/FieldComparator.java
+
+package com.example.reconciliation.service.strategy;
+
+import java.util.Map;
+
+public interface FieldComparator {
+    boolean compare(String value1, String value2, Map<String, String> params);
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/service/strategy/EqualsComparator.java
+
+package com.example.reconciliation.service.strategy;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import java.util.Objects;
+import java.util.Map;
+
+@Component
+@RequiredArgsConstructor
+public class EqualsComparator implements FieldComparator {
+    @Override
+    public boolean compare(String v1, String v2, Map<String, String> params) {
+        return Objects.equals(v1, v2);
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/service/strategy/SubstringComparator.java
+
+package com.example.reconciliation.service.strategy;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import java.util.Map;
+
+@Component
+@RequiredArgsConstructor
+public class SubstringComparator implements FieldComparator {
+    @Override
+    public boolean compare(String v1, String v2, Map<String, String> params) {
+        int start = Integer.parseInt(params.get("start"));
+        int end = Integer.parseInt(params.get("end"));
+        String sub1 = v1 != null ? v1.substring(start, Math.min(end, v1.length())) : "";
+        String sub2 = v2 != null ? v2.substring(start, Math.min(end, v2.length())) : "";
+        return sub1.equals(sub2);
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/service/strategy/ComparatorFactory.java
+
+package com.example.reconciliation.service.strategy;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+@Component
+@RequiredArgsConstructor
+public class ComparatorFactory {
+    private final Map<String, FieldComparator> comparators;
+
+    public ComparatorFactory(List<FieldComparator> comparatorList) {
+        comparators = comparatorList.stream()
+            .collect(Collectors.toMap(
+                c -> c.getClass().getSimpleName().replace("Comparator", "").toLowerCase(),
+                Function.identity()
+            ));
+    }
+
+    public FieldComparator getComparator(String strategy) {
+        return comparators.get(strategy.toLowerCase());
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/data/TestDataGenerator.java
+
+package com.example.reconciliation.data;
+
+import com.example.reconciliation.config.ReconciliationConfig;
+import com.example.reconciliation.model.CompositeKey;
+import com.example.reconciliation.model.Transaction;
+import com.example.reconciliation.repository.RedisTransactionRepository;
+import com.example.reconciliation.service.KeyExtractor;
+import lombok.RequiredArgsConstructor;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.stereotype.Component;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
+
+@Component
+@RequiredArgsConstructor
+public class TestDataGenerator implements CommandLineRunner {
+
+    private final RedisTransactionRepository repository;
+    private final KeyExtractor keyExtractor;
+    private final ReconciliationConfig config;
+
+    @Override
+    public void run(String... args) throws Exception {
+        if (repository.scanTransactions(RedisTransactionRepository.SOURCE1_KEY, 1).hasNext()) {
+            return;
+        }
+        
+        int totalTransactions = 10000;
+        Random random = new Random();
+        for (int i = 1; i <= totalTransactions; i++) {
+            Map<String, String> fields = new HashMap<>();
+            fields.put("transactionId", String.valueOf(i));
+            fields.put("accountNumber", "ACC" + (100 + random.nextInt(900)));
+            fields.put("amount", String.format("%.2f", 100 + random.nextDouble() * 900));
+            fields.put("description", "Payment for invoice " + i);
+            Transaction transaction = new Transaction(fields);
+
+            CompositeKey compositeKey = keyExtractor.extractKey(transaction);
+            String redisKey = compositeKey.toString();
+
+            repository.saveTransaction(RedisTransactionRepository.SOURCE1_KEY, redisKey, transaction);
+
+            Map<String, String> fields2 = new HashMap<>(fields);
+            if (random.nextDouble() < 0.10) {
+                fields2.put("description", "Payment invoice " + i);
+            }
+            if (random.nextDouble() >= 0.05) {
+                Transaction transaction2 = new Transaction(fields2);
+                repository.saveTransaction(RedisTransactionRepository.SOURCE2_KEY, redisKey, transaction2);
+            }
+        }
+    }
+}
+
+
+---
+
+src/main/java/com/example/reconciliation/controller/ReconciliationController.java
+
+package com.example.reconciliation.controller;
+
+import com.example.reconciliation.model.ReconciliationResult;
+import com.example.reconciliation.service.ReconciliationBatchService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequiredArgsConstructor
+public class ReconciliationController {
+
+    private final ReconciliationBatchService reconciliationBatchService;
+
+    @GetMapping("/reconcile/batch")
+    public ReconciliationResult reconcileBatch() {
+        return reconciliationBatchService.reconcileFromRedis();
+    }
+}
+
