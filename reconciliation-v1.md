@@ -773,3 +773,57 @@ public class ReconciliationController {
 ## Summary
 
 This complete example uses Lombok to reduce boilerplate code for getters/setters, SLF4J for logging, and good design patterns (strategy, factory, and aggregation) to build a production‐ready reconciliation framework. Adjust the batch size, logging levels, and error handling as needed for your production environment.
+
+
+
+## DB data
+
+-- Generate Comparison Configurations for reconciliation type "VAM_BAX"
+INSERT INTO comparison_config (reconciliation_type, field_name, source1_field, source2_field, comparison_method, custom_comparison_logic)
+VALUES ('VAM_BAX', 'account_name', 'account_name', 'account_name', 'SUBSTRING', '{"start":0,"end":20}');
+
+INSERT INTO comparison_config (reconciliation_type, field_name, source1_field, source2_field, comparison_method, custom_comparison_logic)
+VALUES ('VAM_BAX', 'balance', 'balance', 'balance', 'EQUALS', NULL);
+
+-- Generate 1,000,000 records for SOURCE1
+INSERT INTO source_data (reconciliation_type, source_type, transaction_id, client_id, client_name, data)
+SELECT 
+    'VAM_BAX' AS reconciliation_type,
+    'SOURCE1' AS source_type,
+    'TX' || gs AS transaction_id,
+    'client' || ((gs % 100) + 1) AS client_id,  -- 100 distinct clients
+    'Client ' || ((gs % 100) + 1) AS client_name,
+    json_build_object(
+         'account_id', gs,
+         'account_name', 'Account ' || gs,
+         'balance', round(random() * 10000::numeric, 2),
+         'status', CASE WHEN random() > 0.9 THEN 'inactive' ELSE 'active' END
+    ) AS data
+FROM generate_series(1, 1000000) gs;
+
+-- Generate SOURCE2 records:
+-- Approximately 95% of the records (simulate missing ~5%),
+-- and simulate mismatches by altering the account_name and balance for some rows.
+INSERT INTO source_data (reconciliation_type, source_type, transaction_id, client_id, client_name, data)
+SELECT 
+    'VAM_BAX' AS reconciliation_type,
+    'SOURCE2' AS source_type,
+    'TX' || gs AS transaction_id,
+    'client' || ((gs % 100) + 1) AS client_id,
+    'Client ' || ((gs % 100) + 1) AS client_name,
+    json_build_object(
+         'account_id', gs,
+         'account_name', 
+              CASE WHEN random() > 0.85 
+                   THEN 'Account ' || gs || '_mismatch' 
+                   ELSE 'Account ' || gs 
+              END,
+         'balance', 
+              CASE WHEN random() > 0.80 
+                   THEN round(random() * 10000::numeric, 2) 
+                   ELSE round(random() * 10000 + 50, 2) 
+              END,
+         'status', CASE WHEN random() > 0.95 THEN 'inactive' ELSE 'active' END
+    ) AS data
+FROM generate_series(1, 1000000) gs
+WHERE random() > 0.05;
