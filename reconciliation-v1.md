@@ -778,14 +778,22 @@ This complete example uses Lombok to reduce boilerplate code for getters/setters
 
 ## DB data
 
--- Generate Comparison Configurations for reconciliation type "VAM_BAX"
-INSERT INTO comparison_config (reconciliation_type, field_name, source1_field, source2_field, comparison_method, custom_comparison_logic)
-VALUES ('VAM_BAX', 'account_name', 'account_name', 'account_name', 'SUBSTRING', '{"start":0,"end":20}');
+Below is an example of an SQL initialization script (e.g., **init-data.sql**) that creates test data for reconciliation and a Spring Boot data-populator class that runs the script at startup.
 
-INSERT INTO comparison_config (reconciliation_type, field_name, source1_field, source2_field, comparison_method, custom_comparison_logic)
-VALUES ('VAM_BAX', 'balance', 'balance', 'balance', 'EQUALS', NULL);
+---
 
--- Generate 1,000,000 records for SOURCE1
+### SQL Script (init-data.sql)
+
+Place this file under **src/main/resources**.
+
+```sql
+-- Create comparison configuration records for reconciliation type "VAM_BAX"
+INSERT INTO comparison_config (reconciliation_type, field_name, source1_field, source2_field, comparison_method, custom_comparison_logic)
+VALUES 
+  ('VAM_BAX', 'account_name', 'account_name', 'account_name', 'SUBSTRING', '{"start":0,"end":20}'),
+  ('VAM_BAX', 'balance', 'balance', 'balance', 'EQUALS', NULL);
+
+-- Generate 1,000,000 records for SOURCE1 (base system data)
 INSERT INTO source_data (reconciliation_type, source_type, transaction_id, client_id, client_name, data)
 SELECT 
     'VAM_BAX' AS reconciliation_type,
@@ -801,9 +809,8 @@ SELECT
     ) AS data
 FROM generate_series(1, 1000000) gs;
 
--- Generate SOURCE2 records:
--- Approximately 95% of the records (simulate missing ~5%),
--- and simulate mismatches by altering the account_name and balance for some rows.
+-- Generate records for SOURCE2:
+-- Approximately 95% of the rows (simulate ~5% missing records) and alter some fields to simulate mismatches.
 INSERT INTO source_data (reconciliation_type, source_type, transaction_id, client_id, client_name, data)
 SELECT 
     'VAM_BAX' AS reconciliation_type,
@@ -827,3 +834,58 @@ SELECT
     ) AS data
 FROM generate_series(1, 1000000) gs
 WHERE random() > 0.05;
+```
+
+---
+
+### Data Populator Class
+
+The following Spring Boot component uses a `CommandLineRunner` along with Spring’s `ResourceDatabasePopulator` to run the **init-data.sql** script when the application starts.
+
+**DataInitializer.java**
+```java
+package com.example.reconciliation;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.Resource;
+import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
+import org.springframework.stereotype.Component;
+
+import javax.sql.DataSource;
+
+@Slf4j
+@Component
+public class DataInitializer implements CommandLineRunner {
+
+    private final DataSource dataSource;
+
+    public DataInitializer(DataSource dataSource) {
+        this.dataSource = dataSource;
+    }
+
+    @Override
+    public void run(String... args) throws Exception {
+        log.info("Starting database initialization using init-data.sql");
+        Resource resource = new ClassPathResource("init-data.sql");
+        ResourceDatabasePopulator populator = new ResourceDatabasePopulator(resource);
+        populator.execute(dataSource);
+        log.info("Database initialization completed.");
+    }
+}
+```
+
+---
+
+### How It Works
+
+- **SQL Script:**  
+  The script inserts two comparison configuration rows for the reconciliation type `"VAM_BAX"`. It then uses PostgreSQL’s `generate_series` to create 1 million records for SOURCE1 and about 95% of 1 million for SOURCE2 (with simulated missing records via `WHERE random() > 0.05` and intentional mismatches via altered JSON fields).
+
+- **DataInitializer:**  
+  When the Spring Boot application starts, the `DataInitializer` runs the **init-data.sql** script automatically against your configured database. This ensures your test data (and comparison configurations) are in place before any reconciliation processes run.
+
+You can now run your Spring Boot application and the script will automatically populate your database with 1 million records (plus simulated missing and mismatched records) for testing your reconciliation framework.
+
+Feel free to adjust the random thresholds or JSON fields in the script as needed for your test scenarios.
