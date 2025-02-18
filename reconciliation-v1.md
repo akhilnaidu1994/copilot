@@ -889,3 +889,217 @@ public class DataInitializer implements CommandLineRunner {
 You can now run your Spring Boot application and the script will automatically populate your database with 1 million records (plus simulated missing and mismatched records) for testing your reconciliation framework.
 
 Feel free to adjust the random thresholds or JSON fields in the script as needed for your test scenarios.
+
+
+Below is a complete example showing two APIs:
+
+1. **Overview API** – Retrieves overview records for all clients for a given date.  
+2. **Detail API** – Retrieves (paginated) detail records for a given run ID.
+
+In these examples, the controllers do not call the repositories directly but instead use dedicated service classes.
+
+---
+
+### Service Classes
+
+#### OverviewService.java
+
+```java
+package com.example.reconciliation.service;
+
+import com.example.reconciliation.entity.ReconciliationOverview;
+import com.example.reconciliation.repository.ReconciliationOverviewRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.util.List;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class OverviewService {
+
+    private final ReconciliationOverviewRepository overviewRepository;
+
+    /**
+     * Retrieves all overview records for a specific date.
+     * It computes the start and end of the day and fetches records whose runDate falls between them.
+     *
+     * @param date the date to filter the overview records.
+     * @return list of overview records for that day.
+     */
+    public List<ReconciliationOverview> getOverviewByDate(LocalDate date) {
+        LocalDateTime startOfDay = date.atStartOfDay();
+        LocalDateTime endOfDay = date.atTime(LocalTime.MAX);
+        log.info("Fetching overview records between {} and {}", startOfDay, endOfDay);
+        return overviewRepository.findByRunDateBetween(startOfDay, endOfDay);
+    }
+}
+```
+
+#### DetailService.java
+
+```java
+package com.example.reconciliation.service;
+
+import com.example.reconciliation.entity.ReconciliationDetail;
+import com.example.reconciliation.repository.ReconciliationDetailRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class DetailService {
+
+    private final ReconciliationDetailRepository detailRepository;
+
+    /**
+     * Retrieves detail records for a given runId with pagination.
+     *
+     * @param runId    the reconciliation run identifier.
+     * @param pageable the pagination information.
+     * @return a page of detail records.
+     */
+    public Page<ReconciliationDetail> getDetails(String runId, Pageable pageable) {
+        log.info("Fetching detail records for runId: {} with pageable: {}", runId, pageable);
+        return detailRepository.findByRunId(runId, pageable);
+    }
+}
+```
+
+---
+
+### Controller Classes
+
+#### OverviewController.java
+
+```java
+package com.example.reconciliation.controller;
+
+import com.example.reconciliation.entity.ReconciliationOverview;
+import com.example.reconciliation.service.OverviewService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDate;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/overview")
+@Slf4j
+@RequiredArgsConstructor
+public class OverviewController {
+
+    private final OverviewService overviewService;
+
+    /**
+     * GET /api/overview?date=yyyy-MM-dd
+     * Retrieves overview records for all clients for the specified date.
+     *
+     * @param date the date to filter by (ISO format: yyyy-MM-dd)
+     * @return a list of overview records for that date.
+     */
+    @GetMapping
+    public List<ReconciliationOverview> getOverviewByDate(
+            @RequestParam("date") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        log.info("Received request for overview records on date: {}", date);
+        return overviewService.getOverviewByDate(date);
+    }
+}
+```
+
+#### DetailController.java
+
+```java
+package com.example.reconciliation.controller;
+
+import com.example.reconciliation.entity.ReconciliationDetail;
+import com.example.reconciliation.service.DetailService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/details")
+@Slf4j
+@RequiredArgsConstructor
+public class DetailController {
+
+    private final DetailService detailService;
+
+    /**
+     * GET /api/details/{runId}?page=0&size=10
+     * Retrieves paginated detail records for the specified runId.
+     *
+     * @param runId    the reconciliation run identifier.
+     * @param pageable pagination parameters (page, size, sort, etc.)
+     * @return a paginated result of detail records.
+     */
+    @GetMapping("/{runId}")
+    public Page<ReconciliationDetail> getDetailsByRunId(
+            @PathVariable String runId,
+            Pageable pageable) {
+        log.info("Received request for details for runId: {} with pagination: {}", runId, pageable);
+        return detailService.getDetails(runId, pageable);
+    }
+}
+```
+
+---
+
+### Repository Method Examples
+
+Make sure your repository interfaces include methods similar to:
+
+**ReconciliationOverviewRepository.java**
+
+```java
+package com.example.reconciliation.repository;
+
+import com.example.reconciliation.entity.ReconciliationOverview;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+public interface ReconciliationOverviewRepository extends JpaRepository<ReconciliationOverview, Long> {
+    List<ReconciliationOverview> findByRunDateBetween(LocalDateTime start, LocalDateTime end);
+}
+```
+
+**ReconciliationDetailRepository.java**
+
+```java
+package com.example.reconciliation.repository;
+
+import com.example.reconciliation.entity.ReconciliationDetail;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface ReconciliationDetailRepository extends JpaRepository<ReconciliationDetail, Long> {
+    Page<ReconciliationDetail> findByRunId(String runId, Pageable pageable);
+}
+```
+
+---
+
+### Summary
+
+- **Overview API:** Accepts a date (in ISO format) as input and returns overview records for all clients whose run date falls on that day.
+- **Detail API:** Accepts a run ID and returns paginated detail records for that run.  
+- Both controllers call service classes rather than the repositories directly.
+
+This design keeps the controllers thin, moves business logic into services, and leverages Spring Data pagination for efficient data retrieval.
